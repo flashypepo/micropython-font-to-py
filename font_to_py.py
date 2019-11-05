@@ -6,10 +6,11 @@
 
 # Some code adapted from Daniel Bader's work at the following URL
 # http://dbader.org/blog/monochrome-font-rendering-with-freetype-and-python
+# With thanks to Stephen Irons @ironss for various improvements.
 
 # The MIT License (MIT)
 #
-# Copyright (c) 2016 Peter Hinch
+# Copyright (c) 2016-2019 Peter Hinch
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -34,6 +35,9 @@ import sys
 import os
 import freetype
 
+MINCHAR = 32  # Ordinal values of default printable ASCII set
+MAXCHAR = 126  # 94 chars
+
 # UTILITIES FOR WRITING PYTHON SOURCECODE TO A FILE
 
 # ByteWriter takes as input a variable name and data values and writes
@@ -41,7 +45,6 @@ import freetype
 # my_variable = b'\x01\x02\x03\x04\x05\x06\x07\x08'\
 
 # Lines are broken with \ for readability.
-
 
 class ByteWriter(object):
     bytes_per_line = 16
@@ -109,10 +112,10 @@ class Bitmap(object):
             print()
         print()
 
-    def bitblt(self, src, row):
+    def bitblt(self, src, top, left):
         """Copy all pixels from `src` into this bitmap"""
         srcpixel = 0
-        dstpixel = row * self.width
+        dstpixel = top * self.width + left
         row_offset = self.width - src.width
 
         for _ in range(src.height):
@@ -164,12 +167,13 @@ class Bitmap(object):
 
 
 class Glyph(object):
-    def __init__(self, pixels, width, height, top, advance_width):
+    def __init__(self, pixels, width, height, top, left, advance_width):
         self.bitmap = Bitmap(width, height, pixels)
 
         # The glyph bitmap's top-side bearing, i.e. the vertical distance from
         # the baseline to the bitmap's top-most scanline.
         self.top = top
+        self.left = left
 
         # Ascent and descent determine how many pixels the glyph extends
         # above or below the baseline.
@@ -195,12 +199,13 @@ class Glyph(object):
         pixels = Glyph.unpack_mono_bitmap(slot.bitmap)
         width, height = slot.bitmap.width, slot.bitmap.rows
         top = slot.bitmap_top
+        left = slot.bitmap_left
 
         # The advance width is given in FreeType's 26.6 fixed point format,
         # which means that the pixel values are multiples of 64.
         advance_width = slot.advance.x / 64
 
-        return Glyph(pixels, width, height, top, advance_width)
+        return Glyph(pixels, width, height, top, left, advance_width)
 
     @staticmethod
     def unpack_mono_bitmap(bitmap):
@@ -258,28 +263,29 @@ class Font(dict):
     def __init__(self, filename, size, minchar, maxchar, monospaced, defchar, charset):
         super().__init__()
         self._face = freetype.Face(filename)
-        self.minchar = minchar
-        self.maxchar = maxchar
+        # .crange is the inclusive range of ordinal values spanning the character set.
+        self.crange = range(minchar, maxchar + 1)
         self.monospaced = monospaced
         self.defchar = defchar
-        # .def_charset is requested charset or '' if -c was not specified
-        self.def_charset = charset
         # .charset has all defined characters with '' for those in range but undefined.
+        # Sort order is increasing ordinal value of the character whether defined or not,
+        # except that item 0 is the default char.
         if defchar is None: # Binary font
-            self.charset = [chr(char) for char in range(minchar, maxchar + 1)]
+            self.charset = [chr(ordv) for ordv in self.crange]
         elif charset == '':
-            self.charset = [chr(defchar)] + [chr(char) for char in range(minchar, maxchar + 1)]
+            self.charset = [chr(defchar)] + [chr(ordv) for ordv in self.crange]
         else:
-            n = sorted([ord(x) for x in chr(defchar) + charset])
-            self.minchar = n[0]
-            self.maxchar = n[-1]
-            self.charset = [chr(defchar)] + [chr(char) if chr(char) in charset else '' for char in range(n[0], n[-1] + 1)]
-        # .pop_charset has only the defined characters
-        self.pop_charset = [c for c in self.charset if c]
+            cl = [ord(x) for x in chr(defchar) + charset if self._face.get_char_index(x) != 0 ]
+            self.crange = range(min(cl), max(cl) + 1)  # Inclusive ordinal value range
+            cs = [chr(ordv) if chr(ordv) in charset and self._face.get_char_index(chr(ordv)) != 0 else '' for ordv in self.crange]
+            # .charset has an item for all chars in range. '' if unsupported.
+            # item 0 is the default char. Subsequent chars are in increasing ordinal value.
+            self.charset = [chr(defchar)] + cs
+        # Populate self with defined chars only
+        self.update(dict.fromkeys([c for c in self.charset if c]))
         self.max_width = self.get_dimensions(size)
         self.width = self.max_width if monospaced else 0
-        for char in self.pop_charset:  # Populate dictionary
-            self._render_char(char)
+        self._assign_values()  # Assign values to existing keys
 
     # n-pass solution to setting a precise height.
     def get_dimensions(self, required_height):
@@ -294,7 +300,7 @@ class Font(dict):
             # and update the overall dimensions of the resulting bitmap.
             max_width = 0
             max_ascent = 0
-            for char in self.pop_charset:
+            for char in self.keys():
                 glyph = self._glyph_for_character(char)
                 max_ascent = max(max_ascent, glyph.ascent)
                 max_descent = max(max_descent, glyph.descent)
@@ -309,6 +315,7 @@ class Font(dict):
         self.height = int(max_ascent + max_descent)
         st = 'Height set in {} passes. Actual height {} pixels.\nMax character width {} pixels.'
         print(st.format(npass + 1, self.height, max_width))
+        self._max_ascent = int(max_ascent)
         self._max_descent = int(max_descent)
         return max_width
 
@@ -321,17 +328,26 @@ class Font(dict):
                              freetype.FT_LOAD_TARGET_MONO)
         return Glyph.from_glyphslot(self._face.glyph)
 
-    def _render_char(self, char):
-        if char:
+    def _assign_values(self):
+        for char in self.keys():
             glyph = self._glyph_for_character(char)
-            char_width = int(max(glyph.width, glyph.advance_width))  # Actual width
+            # https://github.com/peterhinch/micropython-font-to-py/issues/21
+            # Handle negative glyph.left correctly (capital J), 
+            # also glyph.width > advance (capital K and R).
+            if glyph.left >= 0:
+                char_width = int(max(glyph.advance_width, glyph.width + glyph.left))
+                left = glyph.left
+            else:
+                char_width = int(max(glyph.advance_width - glyph.left, glyph.width))
+                left = 0
+
             width = self.width if self.width else char_width  # Space required if monospaced
             outbuffer = Bitmap(width, self.height)
 
             # The vertical drawing position should place the glyph
             # on the baseline as intended.
             row = self.height - int(glyph.ascent) - self._max_descent
-            outbuffer.bitblt(glyph.bitmap, row)
+            outbuffer.bitblt(glyph.bitmap, row, left)
             self[char] = [outbuffer, width, char_width]
 
     def stream_char(self, char, hmap, reverse):
@@ -344,19 +360,36 @@ class Font(dict):
 
     def build_arrays(self, hmap, reverse):
         data = bytearray()
-        index = bytearray() #((0, 0))
-        for char in self.charset:
-            if char == '':
-                index += bytearray((0, 0, 0, 0))
-                index[-1] = index[3]
-                index[-2] = index[2]
-            else:
-                index += (len(data)).to_bytes(2, byteorder='little')  # Start
-                width = self[char][1]
-                data += (width).to_bytes(2, byteorder='little')
-                data += bytearray(self.stream_char(char, hmap, reverse))
-                index += (len(data)).to_bytes(2, byteorder='little')  # End
-        return data, index
+        index = bytearray()
+        sparse = bytearray()
+        def append_data(data, char):
+            width = self[char][1]
+            data += (width).to_bytes(2, byteorder='little')
+            data += bytearray(self.stream_char(char, hmap, reverse))
+
+        # self.charset is contiguous with chars having ordinal values in the
+        # inclusive range specified. Where the specified character set has gaps
+        # missing characters are empty strings.
+        # Charset includes default char and both max and min chars, hence +2.
+        if len(self.charset) <= MAXCHAR - MINCHAR + 2:
+            # Build normal index. Efficient for ASCII set and smaller as
+            # entries are 2 bytes (-> data[0] for absent glyph)
+            for char in self.charset:
+                if char == '':
+                    index += bytearray((0, 0))
+                else:
+                    index += (len(data)).to_bytes(2, byteorder='little')  # Start
+                    append_data(data, char)
+            index += (len(data)).to_bytes(2, byteorder='little')  # End
+        else:
+            # Sparse index. Entries are 4 bytes but only populated if the char
+            # has a defined glyph.
+            append_data(data, self.charset[0])  # data[0] is the default char
+            for char in sorted(self.keys()):
+                sparse += ord(char).to_bytes(2, byteorder='little')
+                sparse += (len(data)).to_bytes(2, byteorder='little')  # Start
+                append_data(data, char)
+        return data, index, sparse
 
     def build_binary_array(self, hmap, reverse, sig):
         data = bytearray((0x3f + sig, 0xe7, self.max_width, self.height))
@@ -367,29 +400,73 @@ class Font(dict):
         return data
 
 # PYTHON FILE WRITING
+# The index only holds the start of data so can't read next_offset but must
+# calculate it.
 
-STR01 = """# Code generated by font-to-py.py.
+STR01 = """# Code generated by font_to_py.py.
 # Font: {}{}
-version = '0.26'
+# Cmd: {}
+version = '0.33'
+
 """
 
+# Code emitted for charsets spanning a small range of ordinal values
 STR02 = """_mvfont = memoryview(_font)
+_mvi = memoryview(_index)
+ifb = lambda l : l[0] | (l[1] << 8)
 
 def get_ch(ch):
-    ordch = ord(ch)
-    ordch = ordch + 1 if ordch >= {} and ordch <= {} else {}
-    idx_offs = 4 * (ordch - {})
-    offset = int.from_bytes(_index[idx_offs : idx_offs + 2], 'little')
-    next_offs = int.from_bytes(_index[idx_offs + 2 : idx_offs + 4], 'little')
-    width = int.from_bytes(_font[offset:offset + 2], 'little')
-    return _mvfont[offset + 2:next_offs], {}, width
+    oc = ord(ch)
+    ioff = 2 * (oc - {0} + 1) if oc >= {0} and oc <= {1} else 0
+    doff = ifb(_mvi[ioff : ])
+    width = ifb(_mvfont[doff : ])
+"""
+
+# Code emiited for large charsets, assumed by build_arrays() to be sparse.
+# Binary search of sorted sparse index.
+STRSP = """_mvfont = memoryview(_font)
+_mvsp = memoryview(_sparse)
+ifb = lambda l : l[0] | (l[1] << 8)
+
+def bs(lst, val):
+    while True:
+        m = (len(lst) & ~ 7) >> 1
+        v = ifb(lst[m:])
+        if v == val:
+            return ifb(lst[m + 2:])
+        if not m:
+            return 0
+        lst = lst[m:] if v < val else lst[:m]
+
+def get_ch(ch):
+    doff = bs(_mvsp, ord(ch))
+    width = ifb(_mvfont[doff : ])
+"""
+
+# Code emitted for horizontally mapped fonts.
+STR02H ="""
+    next_offs = doff + 2 + ((width - 1)//8 + 1) * {0}
+    return _mvfont[doff + 2:next_offs], {0}, width
  
 """
 
+# Code emitted for vertically mapped fonts.
+STR02V ="""
+    next_offs = doff + 2 + (({0} - 1)//8 + 1) * width
+    return _mvfont[doff + 2:next_offs], {0}, width
+ 
+"""
+
+# Extra code emitted where -i is specified.
+STR03 = '''
+def glyphs():
+    for c in """{}""":
+        yield c, get_ch(c)
+
+'''
+
 def write_func(stream, name, arg):
     stream.write('def {}():\n    return {}\n\n'.format(name, arg))
-
-# filename, size, minchar=32, maxchar=126, monospaced=False, defchar=ord('?'):
 
 def write_font(op_path, font_path, height, monospaced, hmap, reverse, minchar, maxchar, defchar, charset, iterate):
     try:
@@ -399,29 +476,22 @@ def write_font(op_path, font_path, height, monospaced, hmap, reverse, minchar, m
         return False
     try:
         with open(op_path, 'w', encoding='utf-8') as stream:
-            write_data(stream, fnt, font_path, hmap, reverse, iterate)
+            write_data(stream, fnt, font_path, hmap, reverse, iterate, charset)
     except OSError:
         print("Can't open", op_path, 'for writing')
         return False
     return True
 
-STR03 = '''
-def glyphs():
-    for c in """{}""":
-        yield c, get_ch(c)
-
-'''
-
-def write_data(stream, fnt, font_path, hmap, reverse, iterate):
+def write_data(stream, fnt, font_path, hmap, reverse, iterate, charset):
     height = fnt.height  # Actual height, not target height
-    minchar = fnt.minchar
-    maxchar = fnt.maxchar
+    minchar = min(fnt.crange)
+    maxchar = max(fnt.crange)
     defchar = fnt.defchar
-    charset = fnt.def_charset
     st = '' if charset == '' else ' Char set: {}'.format(charset)
-    stream.write(STR01.format(os.path.split(font_path)[1], st))
-    stream.write('\n')
+    cl = ' '.join(sys.argv)
+    stream.write(STR01.format(os.path.split(font_path)[1], st, cl))
     write_func(stream, 'height', height)
+    write_func(stream, 'baseline', fnt._max_ascent)
     write_func(stream, 'max_width', fnt.max_width)
     write_func(stream, 'hmap', hmap)
     write_func(stream, 'reverse', reverse)
@@ -429,15 +499,25 @@ def write_data(stream, fnt, font_path, hmap, reverse, iterate):
     write_func(stream, 'min_ch', minchar)
     write_func(stream, 'max_ch', maxchar)
     if iterate:
-        stream.write(STR03.format(''.join(fnt.pop_charset)))
-    data, index = fnt.build_arrays(hmap, reverse)
+        stream.write(STR03.format(''.join(sorted(fnt.keys()))))
+    data, index, sparse = fnt.build_arrays(hmap, reverse)
     bw_font = ByteWriter(stream, '_font')
     bw_font.odata(data)
     bw_font.eot()
-    bw_index = ByteWriter(stream, '_index')
-    bw_index.odata(index)
-    bw_index.eot()
-    stream.write(STR02.format(minchar, maxchar, defchar, minchar, height))
+    if sparse:  # build_arrays() has returned a sparse index
+        bw_sparse = ByteWriter(stream, '_sparse')
+        bw_sparse.odata(sparse)
+        bw_sparse.eot()
+        stream.write(STRSP)
+    else:
+        bw_index = ByteWriter(stream, '_index')
+        bw_index.odata(index)
+        bw_index.eot()
+        stream.write(STR02.format(minchar, maxchar))
+    if hmap:
+        stream.write(STR02H.format(height))
+    else:
+        stream.write(STR02V.format(height))
 
 # BINARY OUTPUT
 # hmap reverse magic bytes
@@ -508,13 +588,13 @@ if __name__ == "__main__":
 
     parser.add_argument('-s', '--smallest',
                         type = int,
-                        default = 32,
+                        default = MINCHAR,
                         help = 'Ordinal value of smallest character default %(default)i')
 
     parser.add_argument('-l', '--largest',
                         type = int,
                         help = 'Ordinal value of largest character default %(default)i',
-                        default = 126)
+                        default = MAXCHAR)
 
     parser.add_argument('-e', '--errchar',
                         type = int,
@@ -532,7 +612,7 @@ if __name__ == "__main__":
                         default = '')
 
     args = parser.parse_args()
-    if not args.infile[0].isalpha():
+    if not args.outfile[0].isalpha():
         quit('Font filenames must be valid Python variable names.')
 
     if not os.path.isfile(args.infile):
@@ -578,7 +658,9 @@ if __name__ == "__main__":
                 sys.exit(1)
         else:
             cset = args.charset
-        cs = {c for c in cset if c.isprintable()} - {args.errchar}  # dedupe and remove default char
+        # dedupe and remove default char. Allow chars in private use area.
+        # https://github.com/peterhinch/micropython-font-to-py/issues/22
+        cs = {c for c in cset if c.isprintable() or (0xE000 <= ord(c) <= 0xF8FF) } - {args.errchar}
         cs = sorted(list(cs))
         cset = ''.join(cs)  # Back to string
         print('Writing Python font file.')
